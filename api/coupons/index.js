@@ -16,20 +16,33 @@ export default async function handler(req, res) {
       res.status(200).json({ coupons: data });
       break;
 
-    case 'POST':
-      const { domain: postDomain, coupons } = req.body;
-      const { data: postData, error: postError } = await supabase
-        .from('coupons')
-        .upsert(
-          coupons.map(c => ({
-            domain: postDomain,
-            code: c.code,
-            discount: c.discount,
-            terms: c.terms,
-            verified: c.verified
-          })),
-          { onConflict: ['domain', 'code'] }
-        );
+      case 'POST':
+        const { domain: postDomain, coupons } = req.body;
+        
+        // Deduplicate coupons before upsert
+        const uniqueCoupons = coupons.reduce((acc, current) => {
+          const exists = acc.find(c => 
+            c.domain === postDomain && 
+            c.code === current.code
+          );
+          return exists ? acc : [...acc, current];
+        }, []);
+      
+        const { data: postData, error: postError } = await supabase
+          .from('coupons')
+          .upsert(
+            uniqueCoupons.map(c => ({
+              domain: postDomain,
+              code: c.code,
+              discount: c.discount,
+              terms: c.terms,
+              verified: c.verified
+            })), 
+            { 
+              onConflict: ['domain,code'], // Use proper conflict resolution
+              ignoreDuplicates: false 
+            }
+          );
       
       if (postError) return res.status(500).json({ error: postError.message });
       res.status(200).json({ success: true });
