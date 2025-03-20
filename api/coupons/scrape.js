@@ -1,15 +1,62 @@
 import { createClient } from "@supabase/supabase-js";
 import puppeteer from "puppeteer-core";
 import chrome from "@sparticuz/chromium";
+import fs from "fs/promises";
+import path from "path";
 
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Ensure logs directory exists
+const LOGS_DIR = path.join(process.cwd(), "logs");
+fs.mkdir(LOGS_DIR, { recursive: true }).catch(console.error);
+
+// Create log file with timestamp
+const LOG_FILE = path.join(
+  LOGS_DIR,
+  `scrape-${new Date().toISOString().replace(/:/g, "-")}.log`
+);
+
+// Setup logging to both console and file
+const log = async (message, level = "INFO") => {
+  const timestamp = new Date().toISOString();
+  const formattedMessage = `[${timestamp}] [${level}] ${message}`;
+
+  console.log(formattedMessage);
+
+  // Also write to log file
+  await fs.appendFile(LOG_FILE, formattedMessage + "\n").catch(console.error);
+};
+
+// Error logger
+const logError = async (message, error) => {
+  await log(`${message}: ${error.message}`, "ERROR");
+  if (error.stack) {
+    await log(error.stack, "ERROR");
+  }
+};
 
 // Browser resources pool
 let browserInstance = null;
 let browserLastUsed = null;
+
+// Configuration for scraping performance
+const CONFIG = {
+  concurrentDomains: process.env.CONCURRENT_DOMAINS
+    ? parseInt(process.env.CONCURRENT_DOMAINS)
+    : 5,
+  batchSize: process.env.BATCH_SIZE ? parseInt(process.env.BATCH_SIZE) : 5,
+  domainRetries: process.env.DOMAIN_RETRIES
+    ? parseInt(process.env.DOMAIN_RETRIES)
+    : 2,
+  modalTimeout: process.env.MODAL_TIMEOUT
+    ? parseInt(process.MODAL_TIMEOUT)
+    : 10000,
+  navigationTimeout: process.env.NAVIGATION_TIMEOUT
+    ? parseInt(process.env.NAVIGATION_TIMEOUT)
+    : 15000,
+  delayBetweenDomains: process.env.DELAY_BETWEEN_DOMAINS
+    ? parseInt(process.env.DELAY_BETWEEN_DOMAINS)
+    : 1000,
+  browserReuseTime: 120000, // Reuse browser if used in last 2 minutes
+};
 
 // Browser management
 async function getBrowser() {
@@ -19,7 +66,7 @@ async function getBrowser() {
   if (
     browserInstance &&
     browserLastUsed &&
-    currentTime - browserLastUsed < 120000
+    currentTime - browserLastUsed < CONFIG.browserReuseTime
   ) {
     browserLastUsed = currentTime;
     return browserInstance;
@@ -29,12 +76,14 @@ async function getBrowser() {
   if (browserInstance) {
     try {
       await browserInstance.close();
+      await log("Closed existing browser instance");
     } catch (e) {
-      console.error("Error closing browser:", e);
+      await logError("Error closing browser", e);
     }
   }
 
   // Launch new browser with optimized settings
+  await log("Launching new browser instance");
   browserInstance = await puppeteer.launch({
     args: [
       ...chrome.args,
@@ -43,6 +92,7 @@ async function getBrowser() {
       "--disable-setuid-sandbox",
       "--disable-gpu",
       "--disable-blink-features=AutomationControlled", // Helps avoid detection
+      "--window-size=1920,1080", // Set a realistic window size
     ],
     defaultViewport: { width: 1024, height: 768 },
     executablePath: await chrome.executablePath(),
@@ -70,51 +120,107 @@ async function getBrowser() {
   return browserInstance;
 }
 
-export default async function handler(req, res) {
-  // Only allow POST requests
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+/**
+ * Scrapes domain names from CouponFollow's category page
+ * @param {string} letter - The letter category (a-z or #) to scrape
+ * @returns {Promise<string[]>} - Array of domain names
+ */
+async function scrapeDomains(letter) {
+  await log(`Scraping domain list for letter: ${letter}...`);
 
-  const { domain } = req.body;
+  const browser = await getBrowser();
 
-  if (!domain) {
-    return res.status(400).json({ error: "Domain parameter is required" });
-  }
-
-  // Send an immediate response to prevent timeout
-  res.status(202).json({ message: "Scraping started" });
-
-  // Continue processing asynchronously
   try {
-    const coupons = await scrapeCoupons(domain);
+    const page = await browser.newPage();
 
-    // Store the scraped coupons in Supabase
-    await supabase.from("coupons").upsert(
-      {
-        domain,
-        coupons,
-        updated_at: new Date().toISOString(),
-      },
-      {
-        onConflict: "domain",
+    // Set a realistic user agent
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+    );
+
+    // Set page options similar to coupon scraper
+    await page.setJavaScriptEnabled(true);
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    });
+
+    // Selective resource blocking to improve performance
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const resourceType = req.resourceType();
+      if (resourceType === "image" || resourceType === "font") {
+        req.abort();
+      } else {
+        req.continue();
       }
-    );
+    });
 
-    console.log(
-      `Successfully scraped and stored ${coupons.length} coupons for ${domain}`
-    );
+    // Override webdriver properties to avoid detection
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => false,
+      });
+      window.navigator.chrome = { runtime: {} };
+      window.navigator.permissions = {
+        query: () => Promise.resolve({ state: "granted" }),
+      };
+    });
+
+    page.setDefaultNavigationTimeout(CONFIG.navigationTimeout);
+
+    // Navigate to the letter's category page
+    const url = `https://couponfollow.com/site/browse/${letter}/all`;
+    await log(`Navigating to ${url}...`);
+
+    await page.goto(url, {
+      waitUntil: "networkidle2",
+      timeout: CONFIG.navigationTimeout,
+    });
+
+    await log(`Page loaded for letter ${letter}, extracting domains...`);
+
+    // Extract domain names from the page
+    const domains = await page.evaluate(() => {
+      const domainList = [];
+
+      // Each store is in a list item with a link
+      const storeLinks = document.querySelectorAll('ul li a[href^="/site/"]');
+
+      storeLinks.forEach((link) => {
+        const href = link.getAttribute("href");
+        if (href) {
+          // Extract domain from the URL format "/site/domain.com"
+          const domain = href.replace("/site/", "");
+          if (domain) {
+            domainList.push(domain);
+          }
+        }
+      });
+
+      return domainList;
+    });
+
+    await log(`Found ${domains.length} domains for letter ${letter}`);
+    await page.close();
+    return domains;
   } catch (error) {
-    console.error(`Error scraping coupons for ${domain}:`, error);
+    await logError(`Error scraping domains for letter ${letter}`, error);
+    return [];
   }
 }
 
-// Optimized scraper with batch processing
-async function scrapeCoupons(domain) {
+/**
+ * Scrapes coupons for a specific domain
+ * @param {string} domain - The domain to scrape coupons for
+ * @param {number} retryCount - Current retry attempt (internal use)
+ * @returns {Promise<Array>} - Array of coupon objects
+ */
+async function scrapeCoupons(domain, retryCount = 0) {
+  await log(`Scraping coupons for ${domain}...`);
+
   let browser = null;
-  const BATCH_SIZE = 5; // Process coupons in batches of 5 (reduced from 10 for more reliability)
-  const MAX_CONCURRENT = 3; // Maximum number of concurrent page operations
-  const MODAL_TIMEOUT = 10000; // Timeout for modal processing in ms
 
   try {
     browser = await getBrowser();
@@ -137,6 +243,17 @@ async function scrapeCoupons(domain) {
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     });
 
+    // Selective resource blocking to improve performance
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const resourceType = req.resourceType();
+      if (resourceType === "image" || resourceType === "font") {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     // Override the navigator.webdriver property to avoid detection
     await page.evaluateOnNewDocument(() => {
       // Pass basic bot detection
@@ -150,27 +267,21 @@ async function scrapeCoupons(domain) {
       };
     });
 
-    // Selective resource blocking - block only unnecessary resources
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const resourceType = req.resourceType();
-      if (resourceType === "image" || resourceType === "font") {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    // Set default navigation timeout
+    page.setDefaultNavigationTimeout(CONFIG.navigationTimeout);
+
+    // Add browser console logs to our logs
+    page.on("console", (msg) =>
+      log(`Browser console [${domain}]: ${msg.text()}`, "BROWSER")
+    );
+
+    await log(`Navigating to couponfollow.com for ${domain}...`);
+    await page.goto(`https://couponfollow.com/site/${domain}`, {
+      waitUntil: "networkidle2",
+      timeout: CONFIG.navigationTimeout,
     });
 
-    // Navigate to CouponFollow with optimized settings
-    const url = `https://couponfollow.com/site/${domain}`;
-    console.log(`Navigating to ${url}...`);
-
-    await page.goto(url, {
-      waitUntil: "networkidle2", // Wait until network is idle for better JS execution
-      timeout: 15000,
-    });
-
-    console.log(`Page loaded for ${domain}, extracting coupon data...`);
+    await log(`Page loaded for ${domain}, extracting coupon data...`);
 
     // Wait for coupon elements with better error handling
     try {
@@ -178,7 +289,7 @@ async function scrapeCoupons(domain) {
         timeout: 8000,
       });
     } catch (err) {
-      console.log("Selector timeout, continuing with extraction");
+      await log("Selector timeout, continuing with extraction", "WARN");
     }
 
     // Extract basic coupon data with modal URLs
@@ -246,12 +357,15 @@ async function scrapeCoupons(domain) {
       return { basicCoupons, modalUrls };
     });
 
-    console.log(
+    await log(
       `Found ${basicCoupons.length} basic coupons for ${domain}, processing modal URLs...`
     );
 
     // Process coupons with modal URLs to get the actual codes
     const completeCoupons = [...basicCoupons];
+
+    // Close the initial page to save resources
+    await page.close();
 
     // Process all coupons in batches
     if (modalUrls.length > 0) {
@@ -264,19 +378,19 @@ async function scrapeCoupons(domain) {
         .filter((item) => item.url && item.coupon.code === "AUTOMATIC");
 
       const totalCoupons = pendingCoupons.length;
-      const totalBatches = Math.ceil(totalCoupons / BATCH_SIZE);
+      const totalBatches = Math.ceil(totalCoupons / CONFIG.batchSize);
 
-      console.log(
-        `Processing ${totalCoupons} modal URLs in ${totalBatches} batches of ${BATCH_SIZE}`
+      await log(
+        `Processing ${totalCoupons} modal URLs in ${totalBatches} batches of ${CONFIG.batchSize}`
       );
 
       // Process in batches
       for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-        const startIndex = batchIndex * BATCH_SIZE;
-        const endIndex = Math.min(startIndex + BATCH_SIZE, totalCoupons);
+        const startIndex = batchIndex * CONFIG.batchSize;
+        const endIndex = Math.min(startIndex + CONFIG.batchSize, totalCoupons);
         const currentBatchItems = pendingCoupons.slice(startIndex, endIndex);
 
-        console.log(
+        await log(
           `Processing batch ${batchIndex + 1}/${totalBatches} (modals ${
             startIndex + 1
           }-${endIndex})`
@@ -285,8 +399,8 @@ async function scrapeCoupons(domain) {
         await processModalBatch(
           browser,
           currentBatchItems,
-          MAX_CONCURRENT,
-          MODAL_TIMEOUT,
+          Math.min(currentBatchItems.length, 3), // Maximum 3 concurrent pages
+          CONFIG.modalTimeout,
           completeCoupons
         );
       }
@@ -298,12 +412,31 @@ async function scrapeCoupons(domain) {
       return cleanCoupon;
     });
   } catch (error) {
-    console.error("Error in scrapeCoupons:", error);
-    return []; // Return empty array instead of throwing
+    await logError(`Error scraping ${domain}`, error);
+
+    // Retry logic
+    if (retryCount < CONFIG.domainRetries) {
+      await log(
+        `Retrying ${domain} (attempt ${retryCount + 1}/${
+          CONFIG.domainRetries
+        })...`,
+        "WARN"
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait before retry
+      return scrapeCoupons(domain, retryCount + 1);
+    }
+    return [];
   }
 }
 
-// Process a batch of modals to extract coupon codes
+/**
+ * Processes a batch of modals to extract coupon codes
+ * @param {Browser} browser - Puppeteer browser instance
+ * @param {Array} batchItems - Array of items to process
+ * @param {number} concurrentLimit - Maximum number of concurrent pages
+ * @param {number} timeout - Timeout for modal processing
+ * @param {Array} completeCoupons - Array to update with extracted codes
+ */
 async function processModalBatch(
   browser,
   batchItems,
@@ -359,7 +492,7 @@ async function processModalBatch(
     batchPromises.push(
       (async () => {
         try {
-          console.log(
+          await log(
             `Processing modal for coupon ${item.index + 1} (Element ID: ${
               item.coupon.elementId || "unknown"
             })`
@@ -380,7 +513,7 @@ async function processModalBatch(
               }
             );
           } catch (err) {
-            console.log(
+            await log(
               `No code input found for modal ${item.index + 1}`,
               "WARN"
             );
@@ -473,13 +606,13 @@ async function processModalBatch(
           // Update the coupon with the extracted code
           if (code && code !== "AUTOMATIC") {
             completeCoupons[item.index].code = code;
-            console.log(
+            await log(
               `Found code ${code} for coupon ${item.index + 1} (ID: ${
                 item.coupon.elementId || "unknown"
               })`
             );
           } else {
-            console.log(
+            await log(
               `No code found for coupon ${item.index + 1} (ID: ${
                 item.coupon.elementId || "unknown"
               })`,
@@ -487,8 +620,8 @@ async function processModalBatch(
             );
           }
         } catch (error) {
-          console.error(
-            `Error processing modal for coupon ${item.index + 1}:`,
+          await logError(
+            `Error processing modal for coupon ${item.index + 1}`,
             error
           );
         }
@@ -503,6 +636,273 @@ async function processModalBatch(
   for (const modalPage of pagePool) {
     await modalPage
       .close()
-      .catch((err) => console.error("Error closing modal page:", err));
+      .catch((err) => logError("Error closing modal page", err));
   }
+}
+
+/**
+ * Saves coupon data to Supabase database
+ * @param {string} domain - Domain name
+ * @param {Array} coupons - Array of coupon objects
+ * @returns {Promise<void>}
+ */
+async function saveToDatabase(domain, coupons, supabase) {
+  // Prepare data for database
+  const uniqueMap = new Map();
+
+  coupons.forEach((coupon) => {
+    const key = `${domain}:${coupon.code}`;
+    if (!uniqueMap.has(key)) {
+      uniqueMap.set(key, {
+        domain,
+        code: coupon.code,
+        discount: coupon.discount,
+        terms: coupon.terms,
+        verified: coupon.verified,
+      });
+    }
+  });
+
+  const uniqueCoupons = Array.from(uniqueMap.values());
+
+  if (uniqueCoupons.length === 0) {
+    await log(`No coupons to save for ${domain}`, "WARN");
+    return;
+  }
+
+  // Save to Supabase
+  try {
+    await log(
+      `Saving ${uniqueCoupons.length} coupons for ${domain} to database...`
+    );
+
+    const { data, error } = await supabase
+      .from("coupons")
+      .upsert(uniqueCoupons, {
+        onConflict: ["domain", "code"],
+        ignoreDuplicates: true,
+      });
+
+    if (error) {
+      await logError(`Error saving coupons for ${domain} to database`, error);
+    } else {
+      await log(
+        `Successfully saved ${uniqueCoupons.length} coupons for ${domain} to database`
+      );
+    }
+  } catch (error) {
+    await logError(`Exception saving coupons for ${domain} to database`, error);
+  }
+}
+
+/**
+ * API handler for Next.js API routes
+ */
+export default async function handler(req, res) {
+  // Only allow POST requests
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const { domain } = req.body;
+
+  if (!domain) {
+    return res.status(400).json({ error: "Domain parameter is required" });
+  }
+
+  // Initialize Supabase client
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !supabaseKey) {
+    console.error(
+      "Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_ANON_KEY environment variables."
+    );
+    return res.status(500).json({ error: "Server configuration error" });
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  // Send an immediate response to prevent timeout
+  res.status(202).json({ message: "Scraping started" });
+
+  // Continue processing asynchronously
+  try {
+    const coupons = await scrapeCoupons(domain);
+
+    if (coupons.length > 0) {
+      await saveToDatabase(domain, coupons, supabase);
+      await log(
+        `Successfully scraped and stored ${coupons.length} coupons for ${domain}`
+      );
+    } else {
+      await log(`No coupons found for ${domain}`, "WARN");
+    }
+  } catch (error) {
+    await logError(`Error scraping coupons for ${domain}`, error);
+  }
+}
+
+/**
+ * Main function to run the scraper for all domains in the alphabet
+ */
+async function main() {
+  await log("Starting coupon scraper...");
+
+  // Initialize Supabase client
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !supabaseKey) {
+    await log(
+      "Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.",
+      "ERROR"
+    );
+    process.exit(1);
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  // Define all alphabet letters including special characters
+  const letters = [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "0",
+  ];
+
+  let totalSuccessCount = 0;
+  let totalErrorCount = 0;
+
+  // Process each letter
+  for (const letter of letters) {
+    await log(`-------------------------------------------`);
+    await log(`Starting to process domains for letter: ${letter}`);
+
+    // Get all domains for this letter
+    const domains = await scrapeDomains(letter);
+
+    if (domains.length === 0) {
+      await log(`No domains found for letter ${letter}, skipping...`, "WARN");
+      continue;
+    }
+
+    await log(
+      `Found ${domains.length} domains for letter ${letter}, starting to scrape coupons...`
+    );
+
+    let letterSuccessCount = 0;
+    let letterErrorCount = 0;
+
+    // Process domains in batches for concurrency
+    for (let i = 0; i < domains.length; i += CONFIG.concurrentDomains) {
+      const batch = domains.slice(i, i + CONFIG.concurrentDomains);
+      await log(
+        `Processing batch of ${batch.length} domains (${i + 1}-${Math.min(
+          i + CONFIG.concurrentDomains,
+          domains.length
+        )} of ${domains.length})...`
+      );
+
+      const results = await Promise.all(
+        batch.map(async (domain) => {
+          try {
+            await log(`Starting processing for domain: ${domain}`);
+
+            const coupons = await scrapeCoupons(domain);
+
+            if (coupons.length > 0) {
+              await saveToDatabase(domain, coupons, supabase);
+              await log(`Completed processing for domain: ${domain}`);
+              return { success: true, domain };
+            } else {
+              await log(`No coupons found for ${domain}`, "WARN");
+              await log(`Completed processing for domain: ${domain}`);
+              return { success: false, domain };
+            }
+          } catch (error) {
+            await logError(`Failed to process domain: ${domain}`, error);
+            return { success: false, domain };
+          }
+        })
+      );
+
+      // Count successes and failures
+      results.forEach((result) => {
+        if (result.success) {
+          letterSuccessCount++;
+          totalSuccessCount++;
+        } else {
+          letterErrorCount++;
+          totalErrorCount++;
+        }
+      });
+
+      // Add a delay between batches to avoid overloading resources
+      if (i + CONFIG.concurrentDomains < domains.length) {
+        await log(
+          `Waiting ${CONFIG.delayBetweenDomains}ms before next batch...`
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, CONFIG.delayBetweenDomains)
+        );
+      }
+    }
+
+    await log(
+      `Letter ${letter} completed: ${letterSuccessCount} successes, ${letterErrorCount} failures`
+    );
+
+    // Add a longer delay between letters to avoid being detected as a bot
+    if (letters.indexOf(letter) < letters.length - 1) {
+      const delayBetweenLetters = CONFIG.delayBetweenDomains * 2; // Twice the domain delay
+      await log(`Waiting ${delayBetweenLetters}ms before next letter...`);
+      await new Promise((resolve) => setTimeout(resolve, delayBetweenLetters));
+    }
+  }
+
+  await log(`----------------------------------------`);
+  await log(`Full alphabet coupon scraping completed!`);
+  await log(`Successfully processed: ${totalSuccessCount} domains`);
+  await log(`Failed to process: ${totalErrorCount} domains`);
+
+  // Exit with error code if all domains failed
+  if (totalSuccessCount === 0) {
+    await log("All domains failed to process", "ERROR");
+    process.exit(1);
+  }
+}
+
+// Export functions for testing and CLI usage
+export { scrapeDomains, scrapeCoupons, saveToDatabase, main };
+
+// Run main if called directly (not imported)
+if (typeof require !== "undefined" && require.main === module) {
+  main().catch((error) => {
+    logError("Fatal error in main", error);
+    process.exit(1);
+  });
 }
