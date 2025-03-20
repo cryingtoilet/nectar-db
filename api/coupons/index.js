@@ -1,107 +1,62 @@
-// File: api/coupons/index.js
 import { createClient } from "@supabase/supabase-js";
 
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Cache TTL (24 hours in seconds)
-const CACHE_TTL = 86400;
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
 export default async function handler(req, res) {
-  // Enable CORS
-  res.setHeader("Access-Control-Allow-Credentials", true);
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version"
-  );
-
-  // Handle preflight request
-  if (req.method === "OPTIONS") {
-    res.status(200).end();
-    return;
-  }
-
-  // GET request to fetch coupons for a domain
-  if (req.method === "GET") {
-    const { domain } = req.query;
-
-    if (!domain) {
-      return res.status(400).json({ error: "Domain parameter is required" });
-    }
-
-    try {
-      // Check if we have cached coupons in Supabase
-      const { data: cachedCoupons, error } = await supabase
+  switch (req.method) {
+    case "GET":
+      const { domain } = req.query;
+      const { data, error } = await supabase
         .from("coupons")
-        .select("*")
+        .select("code, discount, terms, verified")
         .eq("domain", domain)
-        .gt(
-          "updated_at",
-          new Date(Date.now() - CACHE_TTL * 1000).toISOString()
+        .gte(
+          "created_at",
+          new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
         );
 
-      // If we have fresh cached coupons, return them
-      if (!error && cachedCoupons && cachedCoupons.length > 0) {
-        return res.status(200).json({ coupons: cachedCoupons[0].coupons });
-      }
+      if (error) return res.status(500).json({ error: error.message });
+      res.status(200).json({ coupons: data });
+      break;
 
-      // If no cached data, initiate a scrape job
-      const response = await fetch(
-        `${
-          process.env.VERCEL_URL || "http://localhost:3000"
-        }/api/coupons/scrape`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ domain }),
+    case "POST":
+      const { domain: postDomain, coupons } = req.body;
+
+      // Better deduplication - ensures unique domain+code combinations
+      const uniqueMap = new Map();
+      coupons.forEach((coupon) => {
+        const key = `${postDomain}:${coupon.code}`;
+        // Only keep the first occurrence of each domain+code combination
+        if (!uniqueMap.has(key)) {
+          uniqueMap.set(key, {
+            domain: postDomain,
+            code: coupon.code,
+            discount: coupon.discount,
+            terms: coupon.terms,
+            verified: coupon.verified,
+          });
         }
-      );
-
-      // Return empty array for now, the client will retry later
-      return res.status(200).json({
-        coupons: [],
-        message: "Coupons are being scraped, please try again in a few seconds",
       });
-    } catch (error) {
-      console.error("Error fetching coupons:", error);
-      return res.status(200).json({ coupons: [] });
-    }
+
+      const uniqueCoupons = Array.from(uniqueMap.values());
+
+      // Now proceed with the upsert
+      const { data: postData, error: postError } = await supabase
+        .from("coupons")
+        .upsert(uniqueCoupons, {
+          onConflict: ["domain", "code"], // Changed from 'domain,code' to ['domain', 'code']
+          ignoreDuplicates: true, // Changed to true to be extra safe
+        });
+
+      if (postError) return res.status(500).json({ error: postError.message });
+      res.status(200).json({ success: true });
+      break;
+
+    default:
+      res.setHeader("Allow", ["GET", "POST"]);
+      res.status(405).end(`Method ${req.method} Not Allowed`);
   }
-
-  // POST request to store coupons
-  if (req.method === "POST") {
-    const { domain, coupons } = req.body;
-
-    if (!domain || !coupons) {
-      return res.status(400).json({ error: "Domain and coupons are required" });
-    }
-
-    try {
-      const { error } = await supabase.from("coupons").upsert(
-        {
-          domain,
-          coupons,
-          updated_at: new Date().toISOString(),
-        },
-        {
-          onConflict: "domain",
-        }
-      );
-
-      if (error) throw error;
-
-      return res.status(200).json({ success: true });
-    } catch (error) {
-      console.error("Error storing coupons:", error);
-      return res.status(500).json({ error: error.message });
-    }
-  }
-
-  return res.status(405).json({ error: "Method not allowed" });
 }
