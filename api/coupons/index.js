@@ -1,7 +1,5 @@
-// File: api/coupons.js
+// File: api/coupons/index.js
 import { createClient } from "@supabase/supabase-js";
-import puppeteer from "puppeteer-core";
-import chrome from "@sparticuz/chromium";
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -51,29 +49,28 @@ export default async function handler(req, res) {
         return res.status(200).json({ coupons: cachedCoupons[0].coupons });
       }
 
-      // Otherwise, scrape fresh coupons
-      const coupons = await scrapeCoupons(domain);
-
-      // Store the scraped coupons in Supabase
-      const { error: upsertError } = await supabase.from("coupons").upsert(
+      // If no cached data, initiate a scrape job
+      const response = await fetch(
+        `${
+          process.env.VERCEL_URL || "http://localhost:3000"
+        }/api/coupons/scrape`,
         {
-          domain,
-          coupons,
-          updated_at: new Date().toISOString(),
-        },
-        {
-          onConflict: "domain",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ domain }),
         }
       );
 
-      if (upsertError) {
-        console.error("Error storing coupons:", upsertError);
-      }
-
-      return res.status(200).json({ coupons });
+      // Return empty array for now, the client will retry later
+      return res.status(200).json({
+        coupons: [],
+        message: "Coupons are being scraped, please try again in a few seconds",
+      });
     } catch (error) {
       console.error("Error fetching coupons:", error);
-      return res.status(500).json({ error: error.message });
+      return res.status(200).json({ coupons: [] });
     }
   }
 
@@ -107,107 +104,4 @@ export default async function handler(req, res) {
   }
 
   return res.status(405).json({ error: "Method not allowed" });
-}
-
-// Scrape coupons from CouponFollow
-async function scrapeCoupons(domain) {
-  let browser = null;
-
-  try {
-    // Launch browser with Chromium for Vercel
-    browser = await puppeteer.launch({
-      args: [...chrome.args, "--hide-scrollbars", "--disable-web-security"],
-      defaultViewport: chrome.defaultViewport,
-      executablePath: await chrome.executablePath(),
-      headless: true,
-      ignoreHTTPSErrors: true,
-    });
-
-    const page = await browser.newPage();
-    page.setJavaScriptEnabled(true);
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    );
-
-    // Navigate to CouponFollow
-    const url = `https://couponfollow.com/site/${domain}`;
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
-
-    // Extract coupon data
-    const basicCoupons = await page.evaluate(() => {
-      const coupons = [];
-      let idCounter = 1;
-
-      const couponElements = document.querySelectorAll(
-        ".offer-card.regular-offer"
-      );
-
-      couponElements.forEach((element) => {
-        // Only process elements with data-type === "coupon"
-        const dataType = element.getAttribute("data-type");
-        if (dataType !== "coupon") return;
-
-        const discountEl = element.querySelector(".offer-title");
-        const termsEl = element.querySelector(".offer-description");
-        const discount = discountEl?.textContent?.trim() || "Discount";
-        const terms = termsEl?.textContent?.trim() || "Terms apply";
-        const verified = element.getAttribute("data-is-verified") === "True";
-        const modalUrl = element.getAttribute("data-modal");
-
-        coupons.push({
-          id: idCounter++,
-          code: "AUTOMATIC", // Default code, will try to update with actual code
-          discount,
-          terms,
-          verified,
-          source: "CouponFollow",
-          modalUrl,
-        });
-      });
-
-      return coupons;
-    });
-
-    // Process each coupon to get its code
-    const completeCoupons = [];
-    for (const coupon of basicCoupons) {
-      const { modalUrl, ...couponData } = coupon;
-
-      if (modalUrl) {
-        try {
-          page.setJavaScriptEnabled(true);
-          // Navigate to the modal URL to extract the code
-          await page.goto(modalUrl, {
-            waitUntil: "networkidle2",
-            timeout: 10000,
-          });
-
-          // Try to find the code
-          const code = await page.evaluate(() => {
-            const codeElement = document.querySelector(
-              "input#code.input.code, input.input.code"
-            );
-            return codeElement ? codeElement.value.trim() : null;
-          });
-
-          if (code) {
-            couponData.code = code;
-          }
-        } catch (error) {
-          console.error(`Error getting code for coupon ${coupon.id}:`, error);
-        }
-      }
-
-      completeCoupons.push(couponData);
-    }
-
-    return completeCoupons;
-  } catch (error) {
-    console.error("Error in scrapeCoupons:", error);
-    throw error;
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-  }
 }
