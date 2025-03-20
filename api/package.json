@@ -14,5 +14,9 @@
     "@supabase/supabase-js": "^2.49.1",
     "@vercel/node": "^5.1.14",
     "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^133.0.0",
+    "puppeteer-core": "^24.4.0"
   }
 }
