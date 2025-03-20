@@ -124,6 +124,7 @@ async function scrapeCoupons(domain) {
     });
 
     const page = await browser.newPage();
+    page.setJavaScriptEnabled(true);
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     );
@@ -174,6 +175,7 @@ async function scrapeCoupons(domain) {
 
       if (modalUrl) {
         try {
+          page.setJavaScriptEnabled(true);
           // Navigate to the modal URL to extract the code
           await page.goto(modalUrl, {
             waitUntil: "networkidle2",
