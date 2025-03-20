@@ -8,6 +8,53 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Browser resources pool
+let browserInstance = null;
+let browserLastUsed = null;
+
+// Browser management
+async function getBrowser() {
+  const currentTime = Date.now();
+
+  // Reuse browser if it exists and was used in the last 2 minutes
+  if (
+    browserInstance &&
+    browserLastUsed &&
+    currentTime - browserLastUsed < 120000
+  ) {
+    browserLastUsed = currentTime;
+    return browserInstance;
+  }
+
+  // Close old browser if it exists
+  if (browserInstance) {
+    try {
+      await browserInstance.close();
+    } catch (e) {
+      console.error("Error closing browser:", e);
+    }
+  }
+
+  // Launch new browser with optimized settings
+  browserInstance = await puppeteer.launch({
+    args: [
+      ...chrome.args,
+      "--disable-dev-shm-usage",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      // Don't disable JavaScript or web security to ensure coupon sites work properly
+    ],
+    defaultViewport: { width: 1024, height: 768 },
+    executablePath: await chrome.executablePath(),
+    headless: true,
+    ignoreHTTPSErrors: true,
+  });
+
+  browserLastUsed = currentTime;
+  return browserInstance;
+}
+
 export default async function handler(req, res) {
   // Only allow POST requests
   if (req.method !== "POST") {
@@ -47,42 +94,24 @@ export default async function handler(req, res) {
   }
 }
 
-// Optimized scraper
+// Optimized scraper with batch processing
 async function scrapeCoupons(domain) {
   let browser = null;
+  const BATCH_SIZE = 10; // Process coupons in batches of 10
+  const MAX_CONCURRENT = 3; // Maximum number of concurrent page operations
 
   try {
-    // Launch browser with minimal config
-    browser = await puppeteer.launch({
-      args: [
-        ...chrome.args,
-        "--hide-scrollbars",
-        "--disable-web-security",
-        "--disable-extensions",
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--js-flags=--expose-gc",
-        "--disable-gpu",
-      ],
-      defaultViewport: { width: 800, height: 600 },
-      executablePath: await chrome.executablePath(),
-      headless: true,
-      ignoreHTTPSErrors: true,
-    });
+    browser = await getBrowser();
 
+    // Create a primary page for the initial scrape
     const page = await browser.newPage();
+    page.setJavaScriptEnabled(true);
 
-    // Optimize page load
+    // Selective resource blocking - block only unnecessary resources
     await page.setRequestInterception(true);
     page.on("request", (req) => {
-      // Block unnecessary resources
       const resourceType = req.resourceType();
-      if (
-        resourceType === "image" ||
-        resourceType === "font" ||
-        resourceType === "stylesheet"
-      ) {
+      if (resourceType === "image" || resourceType === "font") {
         req.abort();
       } else {
         req.continue();
@@ -93,23 +122,24 @@ async function scrapeCoupons(domain) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     );
 
-    // Navigate to CouponFollow with reduced timeout
+    // Navigate to CouponFollow with optimized settings
     const url = `https://couponfollow.com/site/${domain}`;
+
     await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 12000,
+      waitUntil: "networkidle2", // Wait until network is idle for better JS execution
+      timeout: 15000,
     });
 
-    // Wait for the coupon elements
+    // Wait for coupon elements with better error handling
     try {
       await page.waitForSelector(".offer-card.regular-offer", {
-        timeout: 5000,
+        timeout: 8000,
       });
     } catch (err) {
       console.log("Selector timeout, continuing with extraction");
     }
 
-    // Extract coupon data
+    // Extract basic coupon data
     const basicCoupons = await page.evaluate(() => {
       const coupons = [];
       let idCounter = 1;
@@ -150,19 +180,87 @@ async function scrapeCoupons(domain) {
       return coupons;
     });
 
-    // Only try to get codes for a few top coupons to save time
+    // Process all coupons in batches
     const completeCoupons = [];
-    const couponLimit = Math.min(basicCoupons.length, 5); // Only process top 5 coupons
+    const pendingCoupons = basicCoupons.filter(
+      (coupon) => coupon.modalUrl && coupon.code === "AUTOMATIC"
+    );
 
-    for (let i = 0; i < couponLimit; i++) {
-      const { modalUrl, ...couponData } = basicCoupons[i];
+    // We'll process everything, no more coupon limit
+    for (let i = 0; i < pendingCoupons.length; i += BATCH_SIZE) {
+      const batch = pendingCoupons.slice(i, i + BATCH_SIZE);
+      console.log(
+        `Processing batch ${i / BATCH_SIZE + 1} with ${batch.length} coupons`
+      );
 
-      if (modalUrl && couponData.code === "AUTOMATIC") {
+      // Process batch with concurrency limit
+      const batchResults = await processBatch(browser, batch, MAX_CONCURRENT);
+
+      // Add processed coupons to final list
+      batchResults.forEach((processedCoupon) => {
+        completeCoupons.push(processedCoupon);
+      });
+    }
+
+    // Add coupons that didn't need modal processing
+    basicCoupons
+      .filter((coupon) => !(coupon.modalUrl && coupon.code === "AUTOMATIC"))
+      .forEach((coupon) => {
+        const { modalUrl, ...couponData } = coupon;
+        completeCoupons.push(couponData);
+      });
+
+    // Sort by ID to maintain original order
+    completeCoupons.sort((a, b) => a.id - b.id);
+
+    return completeCoupons;
+  } catch (error) {
+    console.error("Error in scrapeCoupons:", error);
+    return []; // Return empty array instead of throwing
+  }
+}
+
+// Batch processing function with concurrency control
+async function processBatch(browser, coupons, concurrentLimit) {
+  const results = [];
+  const queue = [...coupons];
+  const inProgress = new Set();
+
+  async function processNextItem() {
+    if (queue.length === 0) return;
+
+    const { modalUrl, ...couponData } = queue.shift();
+    inProgress.add(couponData.id);
+
+    try {
+      const page = await browser.newPage();
+
+      // Optimize page resources
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const resourceType = req.resourceType();
+        if (resourceType === "image" || resourceType === "font") {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
+      // Set timeout for the entire operation
+      const pagePromise = new Promise(async (resolve) => {
+        const timeoutId = setTimeout(() => {
+          resolve({ ...couponData });
+          try {
+            page.close();
+          } catch (e) {
+            /* ignore */
+          }
+        }, 8000);
+
         try {
-          // Navigate to the modal URL to extract the code
           await page.goto(modalUrl, {
             waitUntil: "domcontentloaded",
-            timeout: 8000,
+            timeout: 6000,
           });
 
           // Try to find the code
@@ -176,30 +274,50 @@ async function scrapeCoupons(domain) {
           if (code) {
             couponData.code = code;
           }
+
+          clearTimeout(timeoutId);
+          resolve({ ...couponData });
         } catch (error) {
-          console.error(
-            `Error getting code for coupon ${couponData.id}:`,
-            error
-          );
+          console.error(`Error processing coupon ${couponData.id}:`, error);
+          clearTimeout(timeoutId);
+          resolve({ ...couponData });
+        } finally {
+          try {
+            await page.close();
+          } catch (e) {
+            /* ignore */
+          }
         }
-      }
+      });
 
-      completeCoupons.push(couponData);
+      const result = await pagePromise;
+      results.push(result);
+    } catch (e) {
+      console.error(`Error in page creation for coupon ${couponData.id}:`, e);
+      results.push({ ...couponData });
+    } finally {
+      inProgress.delete(couponData.id);
     }
 
-    // Add remaining coupons without processing modals
-    for (let i = couponLimit; i < basicCoupons.length; i++) {
-      const { modalUrl, ...couponData } = basicCoupons[i];
-      completeCoupons.push(couponData);
-    }
-
-    return completeCoupons;
-  } catch (error) {
-    console.error("Error in scrapeCoupons:", error);
-    return []; // Return empty array instead of throwing
-  } finally {
-    if (browser) {
-      await browser.close();
+    // Start next item if queue is not empty and we're under concurrency limit
+    if (queue.length > 0 && inProgress.size < concurrentLimit) {
+      await processNextItem();
     }
   }
+
+  // Start initial batch of concurrent operations
+  const initialBatch = Math.min(concurrentLimit, queue.length);
+  const initialPromises = [];
+
+  for (let i = 0; i < initialBatch; i++) {
+    initialPromises.push(processNextItem());
+  }
+
+  // Wait for all items to be processed
+  await Promise.all(initialPromises);
+  while (inProgress.size > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  return results;
 }

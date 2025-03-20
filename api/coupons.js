@@ -147,6 +147,7 @@ async function scrapeCoupons(domain) {
     });
 
     const page = await browser.newPage();
+    page.setJavaScriptEnabled(true);
 
     // Optimize page load
     await page.setRequestInterception(true);
