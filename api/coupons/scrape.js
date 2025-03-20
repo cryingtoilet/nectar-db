@@ -1,4 +1,3 @@
-// File: api/coupons/scrape.js
 import { createClient } from "@supabase/supabase-js";
 import puppeteer from "puppeteer-core";
 import chrome from "@sparticuz/chromium";
@@ -43,13 +42,29 @@ async function getBrowser() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-gpu",
-      // Don't disable JavaScript or web security to ensure coupon sites work properly
+      "--disable-blink-features=AutomationControlled", // Helps avoid detection
     ],
     defaultViewport: { width: 1024, height: 768 },
     executablePath: await chrome.executablePath(),
     headless: true,
     ignoreHTTPSErrors: true,
   });
+
+  // Add anti-detection measures
+  const pages = await browserInstance.pages();
+  if (pages.length > 0) {
+    await pages[0].evaluateOnNewDocument(() => {
+      // Pass basic bot detection
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => false,
+      });
+      // Override Chrome/Puppeteer specific properties
+      window.navigator.chrome = { runtime: {} };
+      window.navigator.permissions = {
+        query: () => Promise.resolve({ state: "granted" }),
+      };
+    });
+  }
 
   browserLastUsed = currentTime;
   return browserInstance;
@@ -97,15 +112,43 @@ export default async function handler(req, res) {
 // Optimized scraper with batch processing
 async function scrapeCoupons(domain) {
   let browser = null;
-  const BATCH_SIZE = 10; // Process coupons in batches of 10
+  const BATCH_SIZE = 5; // Process coupons in batches of 5 (reduced from 10 for more reliability)
   const MAX_CONCURRENT = 3; // Maximum number of concurrent page operations
+  const MODAL_TIMEOUT = 10000; // Timeout for modal processing in ms
 
   try {
     browser = await getBrowser();
 
     // Create a primary page for the initial scrape
     const page = await browser.newPage();
-    page.setJavaScriptEnabled(true);
+
+    // Set a realistic user agent
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+    );
+
+    // Enable JavaScript
+    await page.setJavaScriptEnabled(true);
+
+    // Set extra headers to appear more like a real browser
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    });
+
+    // Override the navigator.webdriver property to avoid detection
+    await page.evaluateOnNewDocument(() => {
+      // Pass basic bot detection
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => false,
+      });
+      // Override Chrome/Puppeteer specific properties
+      window.navigator.chrome = { runtime: {} };
+      window.navigator.permissions = {
+        query: () => Promise.resolve({ state: "granted" }),
+      };
+    });
 
     // Selective resource blocking - block only unnecessary resources
     await page.setRequestInterception(true);
@@ -118,17 +161,16 @@ async function scrapeCoupons(domain) {
       }
     });
 
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    );
-
     // Navigate to CouponFollow with optimized settings
     const url = `https://couponfollow.com/site/${domain}`;
+    console.log(`Navigating to ${url}...`);
 
     await page.goto(url, {
       waitUntil: "networkidle2", // Wait until network is idle for better JS execution
       timeout: 15000,
     });
+
+    console.log(`Page loaded for ${domain}, extracting coupon data...`);
 
     // Wait for coupon elements with better error handling
     try {
@@ -139,185 +181,328 @@ async function scrapeCoupons(domain) {
       console.log("Selector timeout, continuing with extraction");
     }
 
-    // Extract basic coupon data
-    const basicCoupons = await page.evaluate(() => {
-      const coupons = [];
+    // Extract basic coupon data with modal URLs
+    const { basicCoupons, modalUrls } = await page.evaluate(() => {
+      const basicCoupons = [];
+      const modalUrls = [];
       let idCounter = 1;
 
       const couponElements = document.querySelectorAll(
         ".offer-card.regular-offer"
       );
 
+      console.log(`Found ${couponElements.length} offer cards`);
+
       couponElements.forEach((element) => {
+        // Skip if not a coupon
         const dataType = element.getAttribute("data-type");
-        if (dataType !== "coupon") return;
+        if (dataType !== "coupon") {
+          console.log(
+            `Skipping non-coupon element with data-type: ${dataType}`
+          );
+          return;
+        }
 
         const discountEl = element.querySelector(".offer-title");
         const termsEl = element.querySelector(".offer-description");
+
         const discount = discountEl?.textContent?.trim() || "Discount";
         const terms = termsEl?.textContent?.trim() || "Terms apply";
         const verified = element.getAttribute("data-is-verified") === "True";
-        const modalUrl = element.getAttribute("data-modal");
 
-        // Get code directly if possible
+        // Extract direct code if available in the element
         let code = "AUTOMATIC";
-        const codeEl = element.querySelector(".coupon-code");
-        if (codeEl && codeEl.textContent) {
-          code = codeEl.textContent.trim();
+
+        // Try to get code from clipboard data or other attributes
+        const showCodeBtn = element.querySelector(".show-code");
+        if (showCodeBtn) {
+          const dataCode =
+            showCodeBtn.getAttribute("data-code") ||
+            showCodeBtn.getAttribute("data-clipboard-text");
+          if (dataCode) {
+            code = dataCode;
+          }
         }
 
-        coupons.push({
+        // Get the direct modal URL (not the hash URL)
+        const modalUrl = element.getAttribute("data-modal");
+
+        // Store element ID for debugging
+        const elementId = element.getAttribute("id") || `coupon-${idCounter}`;
+
+        basicCoupons.push({
           id: idCounter++,
           code,
           discount,
           terms,
           verified,
           source: "CouponFollow",
-          modalUrl,
+          elementId, // Store element ID for reference
         });
+
+        modalUrls.push(modalUrl);
       });
 
-      return coupons;
+      return { basicCoupons, modalUrls };
     });
 
-    // Process all coupons in batches
-    const completeCoupons = [];
-    const pendingCoupons = basicCoupons.filter(
-      (coupon) => coupon.modalUrl && coupon.code === "AUTOMATIC"
+    console.log(
+      `Found ${basicCoupons.length} basic coupons for ${domain}, processing modal URLs...`
     );
 
-    // We'll process everything, no more coupon limit
-    for (let i = 0; i < pendingCoupons.length; i += BATCH_SIZE) {
-      const batch = pendingCoupons.slice(i, i + BATCH_SIZE);
+    // Process coupons with modal URLs to get the actual codes
+    const completeCoupons = [...basicCoupons];
+
+    // Process all coupons in batches
+    if (modalUrls.length > 0) {
+      const pendingCoupons = modalUrls
+        .map((url, index) => ({
+          url,
+          index,
+          coupon: basicCoupons[index],
+        }))
+        .filter((item) => item.url && item.coupon.code === "AUTOMATIC");
+
+      const totalCoupons = pendingCoupons.length;
+      const totalBatches = Math.ceil(totalCoupons / BATCH_SIZE);
+
       console.log(
-        `Processing batch ${i / BATCH_SIZE + 1} with ${batch.length} coupons`
+        `Processing ${totalCoupons} modal URLs in ${totalBatches} batches of ${BATCH_SIZE}`
       );
 
-      // Process batch with concurrency limit
-      const batchResults = await processBatch(browser, batch, MAX_CONCURRENT);
+      // Process in batches
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        const startIndex = batchIndex * BATCH_SIZE;
+        const endIndex = Math.min(startIndex + BATCH_SIZE, totalCoupons);
+        const currentBatchItems = pendingCoupons.slice(startIndex, endIndex);
 
-      // Add processed coupons to final list
-      batchResults.forEach((processedCoupon) => {
-        completeCoupons.push(processedCoupon);
-      });
+        console.log(
+          `Processing batch ${batchIndex + 1}/${totalBatches} (modals ${
+            startIndex + 1
+          }-${endIndex})`
+        );
+
+        await processModalBatch(
+          browser,
+          currentBatchItems,
+          MAX_CONCURRENT,
+          MODAL_TIMEOUT,
+          completeCoupons
+        );
+      }
     }
 
-    // Add coupons that didn't need modal processing
-    basicCoupons
-      .filter((coupon) => !(coupon.modalUrl && coupon.code === "AUTOMATIC"))
-      .forEach((coupon) => {
-        const { modalUrl, ...couponData } = coupon;
-        completeCoupons.push(couponData);
-      });
-
-    // Sort by ID to maintain original order
-    completeCoupons.sort((a, b) => a.id - b.id);
-
-    return completeCoupons;
+    // Clean up and return coupons without internal properties
+    return completeCoupons.map((coupon) => {
+      const { elementId, ...cleanCoupon } = coupon;
+      return cleanCoupon;
+    });
   } catch (error) {
     console.error("Error in scrapeCoupons:", error);
     return []; // Return empty array instead of throwing
   }
 }
 
-// Batch processing function with concurrency control
-async function processBatch(browser, coupons, concurrentLimit) {
-  const results = [];
-  const queue = [...coupons];
-  const inProgress = new Set();
+// Process a batch of modals to extract coupon codes
+async function processModalBatch(
+  browser,
+  batchItems,
+  concurrentLimit,
+  timeout,
+  completeCoupons
+) {
+  // Create a page pool for this batch
+  const pagePool = [];
+  for (let i = 0; i < Math.min(batchItems.length, concurrentLimit); i++) {
+    const modalPage = await browser.newPage();
 
-  async function processNextItem() {
-    if (queue.length === 0) return;
+    // Set a realistic user agent
+    await modalPage.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+    );
 
-    const { modalUrl, ...couponData } = queue.shift();
-    inProgress.add(couponData.id);
+    // Enable JavaScript
+    await modalPage.setJavaScriptEnabled(true);
 
-    try {
-      const page = await browser.newPage();
-
-      // Optimize page resources
-      await page.setRequestInterception(true);
-      page.on("request", (req) => {
-        const resourceType = req.resourceType();
-        if (resourceType === "image" || resourceType === "font") {
-          req.abort();
-        } else {
-          req.continue();
-        }
+    // Additional anti-detection measures for modal page
+    await modalPage.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => false,
       });
+      window.navigator.chrome = { runtime: {} };
+      window.navigator.permissions = {
+        query: () => Promise.resolve({ state: "granted" }),
+      };
+    });
 
-      // Set timeout for the entire operation
-      const pagePromise = new Promise(async (resolve) => {
-        const timeoutId = setTimeout(() => {
-          resolve({ ...couponData });
-          try {
-            page.close();
-          } catch (e) {
-            /* ignore */
-          }
-        }, 8000);
+    // Selective resource blocking for modal pages
+    await modalPage.setRequestInterception(true);
+    modalPage.on("request", (req) => {
+      const resourceType = req.resourceType();
+      if (resourceType === "image" || resourceType === "font") {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
 
+    pagePool.push(modalPage);
+  }
+
+  // Process each item in the batch with the page pool
+  const batchPromises = [];
+
+  for (let i = 0; i < batchItems.length; i++) {
+    const item = batchItems[i];
+    const modalPage = pagePool[i % pagePool.length]; // Cycle through the page pool
+
+    batchPromises.push(
+      (async () => {
         try {
-          await page.goto(modalUrl, {
-            waitUntil: "domcontentloaded",
-            timeout: 6000,
+          console.log(
+            `Processing modal for coupon ${item.index + 1} (Element ID: ${
+              item.coupon.elementId || "unknown"
+            })`
+          );
+
+          // Navigate directly to the modal URL
+          await modalPage.goto(item.url, {
+            waitUntil: ["load", "domcontentloaded"],
+            timeout: timeout,
           });
 
-          // Try to find the code
-          const code = await page.evaluate(() => {
-            const codeElement = document.querySelector(
-              "input#code.input.code, input.input.code"
-            );
-            return codeElement ? codeElement.value.trim() : null;
-          });
-
-          if (code) {
-            couponData.code = code;
-          }
-
-          clearTimeout(timeoutId);
-          resolve({ ...couponData });
-        } catch (error) {
-          console.error(`Error processing coupon ${couponData.id}:`, error);
-          clearTimeout(timeoutId);
-          resolve({ ...couponData });
-        } finally {
+          // Wait for potential code input fields to load
           try {
-            await page.close();
-          } catch (e) {
-            /* ignore */
+            await modalPage.waitForSelector(
+              "input#code.input.code, input.input.code, .coupon-code, .code-text, [data-clipboard-text], [data-code]",
+              {
+                timeout: 5000,
+              }
+            );
+          } catch (err) {
+            console.log(
+              `No code input found for modal ${item.index + 1}`,
+              "WARN"
+            );
           }
+
+          // Add a small delay to ensure dynamic content is loaded
+          await modalPage.evaluate(() => {
+            return new Promise((resolve) => setTimeout(resolve, 500));
+          });
+
+          // Extract the code from the modal using multiple approaches
+          const code = await modalPage.evaluate(() => {
+            // Try various selectors to find the code
+            const selectors = [
+              "input#code.input.code",
+              "input.input.code",
+              ".coupon-code",
+              ".code-text",
+              "[data-clipboard-text]",
+              "[data-code]",
+            ];
+
+            // Try the selectors in order
+            for (const selector of selectors) {
+              const element = document.querySelector(selector);
+              if (!element) continue;
+
+              // Handle different element types
+              if (element.tagName === "INPUT") {
+                const value = element.value.trim();
+                if (value) return value;
+              } else {
+                // For non-input elements, try data attributes first
+                const clipboardText = element.getAttribute(
+                  "data-clipboard-text"
+                );
+                if (clipboardText) return clipboardText.trim();
+
+                const dataCode = element.getAttribute("data-code");
+                if (dataCode) return dataCode.trim();
+
+                // Last resort: use text content
+                const textContent = element.textContent.trim();
+                if (textContent) return textContent;
+              }
+            }
+
+            // Return a Promise that resolves after a delay to try again
+            return new Promise((resolve) => {
+              setTimeout(() => {
+                // Try once more after a short delay
+                for (const selector of selectors) {
+                  const element = document.querySelector(selector);
+                  if (!element) continue;
+
+                  if (element.tagName === "INPUT") {
+                    const value = element.value.trim();
+                    if (value) {
+                      resolve(value);
+                      return;
+                    }
+                  } else {
+                    const clipboardText = element.getAttribute(
+                      "data-clipboard-text"
+                    );
+                    if (clipboardText) {
+                      resolve(clipboardText.trim());
+                      return;
+                    }
+
+                    const dataCode = element.getAttribute("data-code");
+                    if (dataCode) {
+                      resolve(dataCode.trim());
+                      return;
+                    }
+
+                    const textContent = element.textContent.trim();
+                    if (textContent) {
+                      resolve(textContent);
+                      return;
+                    }
+                  }
+                }
+
+                resolve("AUTOMATIC"); // Default if no code found
+              }, 500); // Wait 500ms before trying again
+            });
+          });
+
+          // Update the coupon with the extracted code
+          if (code && code !== "AUTOMATIC") {
+            completeCoupons[item.index].code = code;
+            console.log(
+              `Found code ${code} for coupon ${item.index + 1} (ID: ${
+                item.coupon.elementId || "unknown"
+              })`
+            );
+          } else {
+            console.log(
+              `No code found for coupon ${item.index + 1} (ID: ${
+                item.coupon.elementId || "unknown"
+              })`,
+              "WARN"
+            );
+          }
+        } catch (error) {
+          console.error(
+            `Error processing modal for coupon ${item.index + 1}:`,
+            error
+          );
         }
-      });
-
-      const result = await pagePromise;
-      results.push(result);
-    } catch (e) {
-      console.error(`Error in page creation for coupon ${couponData.id}:`, e);
-      results.push({ ...couponData });
-    } finally {
-      inProgress.delete(couponData.id);
-    }
-
-    // Start next item if queue is not empty and we're under concurrency limit
-    if (queue.length > 0 && inProgress.size < concurrentLimit) {
-      await processNextItem();
-    }
+      })()
+    );
   }
 
-  // Start initial batch of concurrent operations
-  const initialBatch = Math.min(concurrentLimit, queue.length);
-  const initialPromises = [];
+  // Wait for all modals in this batch to complete
+  await Promise.all(batchPromises);
 
-  for (let i = 0; i < initialBatch; i++) {
-    initialPromises.push(processNextItem());
+  // Close all pages in the pool
+  for (const modalPage of pagePool) {
+    await modalPage
+      .close()
+      .catch((err) => console.error("Error closing modal page:", err));
   }
-
-  // Wait for all items to be processed
-  await Promise.all(initialPromises);
-  while (inProgress.size > 0) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-
-  return results;
 }
